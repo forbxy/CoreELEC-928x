@@ -1,0 +1,943 @@
+Subject: [PATCH] dvfel: convert Kodi GUI to a physical-grid TV-led overlay
+
+Retain software PQ GUI/PGS conversion while native Dolby processing is off.
+Scale GUI before carrier packing, submit physical-sized OSD buffers without
+another plane scaler, and own premultiplied alpha for the carrier session.
+Protect the picture's CCM pixels with transparent GUI scanlines. Ordinary
+playback keeps its original path. Hardware alpha remains byte-domain GUI
+mixing, not exact 12-bit-domain video composition.
+Requires the 9911 carrier and 9912 normal output lifecycle patches.
+---
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "ServiceBroker.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/AMLCodec.h"
++#include "cores/VideoPlayer/DVDCodecs/Video/AMLDvFelOutput.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.h"
+ #include "cores/VideoPlayer/VideoRenderers/RenderFactory.h"
+ #include "cores/VideoPlayer/VideoRenderers/RenderFlags.h"
+@@ -96,7 +97,7 @@
+   ManageRenderArea();
+ 
+   int color_transfer = 0;
+-  const bool dv_graphics =
++  bool dv_graphics =
+       picture.hdrType == StreamHdrType::HDR_TYPE_DOLBYVISION && aml_dolby_vision_enabled();
+   switch (picture.color_space)
+   {
+@@ -149,6 +150,12 @@
+   if (dv_graphics)
+     color_transfer = AVCOL_TRC_SMPTE2084;
+ 
++  if (CAMLDvFelOutput::Active())
++  {
++    color_transfer = AVCOL_TRC_SMPTE2084;
++    dv_graphics = false;
++  }
++
+   const auto winSystem = static_cast<CWinSystemAmlogic*>(CServiceBroker::GetWinSystem());
+   if (color_transfer != 0)
+   {
+diff --git a/xbmc/guilib/GUIFontTTFGLES.cpp b/xbmc/guilib/GUIFontTTFGLES.cpp
+--- a/xbmc/guilib/GUIFontTTFGLES.cpp
++++ b/xbmc/guilib/GUIFontTTFGLES.cpp
+@@ -145,6 +145,22 @@
+ 
+   CRenderSystemGLES* renderSystem =
+       dynamic_cast<CRenderSystemGLES*>(CServiceBroker::GetRenderSystem());
++
++  if (m_vertexTrans.empty())
++  {
++    static bool loggedInvalidEmptyBatch = false;
++    const GLint pos = renderSystem->GUIShaderGetPos();
++    const GLint col = renderSystem->GUIShaderGetCol();
++    const GLint tex = renderSystem->GUIShaderGetCoord0();
++    if (!loggedInvalidEmptyBatch && (pos < 0 || col < 0 || tex < 0))
++    {
++      CLog::Log(LOGDEBUG, "Empty font batch skipped with shader locations pos {}, col {}, tex {}",
++                pos, col, tex);
++      loggedInvalidEmptyBatch = true;
++    }
++    renderSystem->DisableGUIShader();
++    return;
++  }
+ 
+   GLint posLoc = renderSystem->GUIShaderGetPos();
+   GLint colLoc = renderSystem->GUIShaderGetCol();
+diff --git a/xbmc/rendering/gles/GuiCompositeShaderGLES.cpp b/xbmc/rendering/gles/GuiCompositeShaderGLES.cpp
+--- a/xbmc/rendering/gles/GuiCompositeShaderGLES.cpp
++++ b/xbmc/rendering/gles/GuiCompositeShaderGLES.cpp
+@@ -7,6 +7,10 @@
+  */
+ 
+ #include "GuiCompositeShaderGLES.h"
++#if defined(HAS_LIBAMCODEC)
++#include "cores/VideoPlayer/DVDCodecs/Video/AMLDvFelOutput.h"
++#include "cores/VideoPlayer/DVDCodecs/Video/tvled_gui_shader.h"
++#endif
+ 
+ #include "utils/log.h"
+ 
+@@ -58,7 +62,16 @@
+ CGuiCompositeShaderGLES::CGuiCompositeShaderGLES(const std::string& prefix)
+ {
+   VertexShader()->LoadSource("gles_gui_composite.vert", prefix);
+-  PixelShader()->LoadSource("gles_gui_composite.frag", prefix);
++#if defined(HAS_LIBAMCODEC)
++  if (CAMLDvFelOutput::Active())
++  {
++    std::string source(TVLED_GUI_PQ_SHADER);
++    source.insert(source.find('\n') + 1, prefix);
++    PixelShader()->SetSource(source);
++  }
++  else
++#endif
++    PixelShader()->LoadSource("gles_gui_composite.frag", prefix);
+ }
+ 
+ CGuiCompositeShaderGLES::~CGuiCompositeShaderGLES()
+diff --git a/xbmc/windowing/amlogic/AMLDisplay.cpp b/xbmc/windowing/amlogic/AMLDisplay.cpp
+--- a/xbmc/windowing/amlogic/AMLDisplay.cpp
++++ b/xbmc/windowing/amlogic/AMLDisplay.cpp
+@@ -994,7 +994,64 @@
+   return false;
+ }
+ 
+-void CAMLDRMUtils::FlipPage(uint32_t fb_id)
++bool CAMLDRMUtils::SetTvledGuiBlend(bool enabled)
++{
++  std::unique_lock<CCriticalSection> lock(m_drmSection);
++  if (!enabled && m_tvledSavedBlend < 0)
++    return true;
++  if (!m_plane)
++    return false;
++  DrmProp prop;
++  if (!find_drmProp(m_plane->plane_id, DRM_MODE_OBJECT_PLANE, "pixel blend mode", prop))
++    return false;
++  const int current = get_drmProp(m_plane->plane_id, "pixel blend mode", DRM_MODE_OBJECT_PLANE);
++  if (current < 0)
++    return false;
++  uint64_t target = 0;
++  if (enabled)
++  {
++    drmModePropertyPtr definition = drmModeGetProperty(m_fd, prop.id);
++    if (!definition)
++      return false;
++    bool found = false;
++    for (int i = 0; i < definition->count_enums; ++i)
++    {
++      if (StringUtils::EqualsNoCase(definition->enums[i].name, "Pre-multiplied"))
++      {
++        target = definition->enums[i].value;
++        found = true;
++        break;
++      }
++    }
++    drmModeFreeProperty(definition);
++    if (!found)
++      return false;
++    if (m_tvledSavedBlend < 0)
++      m_tvledSavedBlend = current;
++  }
++  else
++    target = static_cast<uint64_t>(m_tvledSavedBlend);
++
++  if (static_cast<uint64_t>(current) != target)
++  {
++    drmModeAtomicReqPtr req = drmModeAtomicAlloc();
++    if (!req)
++      return false;
++    const bool added = drmModeAtomicAddProperty(req, m_plane->plane_id, prop.id, target) >= 0;
++    const bool committed = added && drmModeAtomicCommit(m_fd, req, 0, nullptr) == 0;
++    drmModeAtomicFree(req);
++    if (!committed)
++      return false;
++  }
++  if (get_drmProp(m_plane->plane_id, "pixel blend mode", DRM_MODE_OBJECT_PLANE) !=
++      static_cast<int>(target))
++    return false;
++  if (!enabled)
++    m_tvledSavedBlend = -1;
++  return true;
++}
++
++void CAMLDRMUtils::FlipPage(uint32_t fb_id, unsigned int bufferWidth, unsigned int bufferHeight)
+ {
+   if (!aml_get_drmDevice_connected())
+     return;
+@@ -1010,8 +1067,10 @@
+   set_drmProp(m_plane->plane_id, "CRTC_ID", DRM_MODE_OBJECT_PLANE , m_crtc->crtc_id, req);
+   set_drmProp(m_plane->plane_id, "SRC_X", DRM_MODE_OBJECT_PLANE , 0, req);
+   set_drmProp(m_plane->plane_id, "SRC_Y", DRM_MODE_OBJECT_PLANE , 0, req);
+-  set_drmProp(m_plane->plane_id, "SRC_W", DRM_MODE_OBJECT_PLANE , m_width << 16, req);
+-  set_drmProp(m_plane->plane_id, "SRC_H", DRM_MODE_OBJECT_PLANE , m_height << 16, req);
++  set_drmProp(m_plane->plane_id, "SRC_W", DRM_MODE_OBJECT_PLANE ,
++              (bufferWidth ? bufferWidth : m_width) << 16, req);
++  set_drmProp(m_plane->plane_id, "SRC_H", DRM_MODE_OBJECT_PLANE ,
++              (bufferHeight ? bufferHeight : m_height) << 16, req);
+   set_drmProp(m_plane->plane_id, "CRTC_X", DRM_MODE_OBJECT_PLANE , 0, req);
+   set_drmProp(m_plane->plane_id, "CRTC_Y", DRM_MODE_OBJECT_PLANE , 0, req);
+   set_drmProp(m_plane->plane_id, "CRTC_W", DRM_MODE_OBJECT_PLANE , m_ScreenWidth, req);
+diff --git a/xbmc/windowing/amlogic/AMLDisplay.h b/xbmc/windowing/amlogic/AMLDisplay.h
+--- a/xbmc/windowing/amlogic/AMLDisplay.h
++++ b/xbmc/windowing/amlogic/AMLDisplay.h
+@@ -106,7 +106,8 @@
+   bool aml_set_drmDevice_active(std::string mode, int fractional_rate,
+     const RenderStereoMode stereo_mode, bool force_mode_switch, bool active);
+   bool aml_get_drmDevice_connected() const { return m_connection == DRM_MODE_CONNECTED; }
+-  void FlipPage(uint32_t fb_id);
++  void FlipPage(uint32_t fb_id, unsigned int bufferWidth = 0, unsigned int bufferHeight = 0);
++  bool SetTvledGuiBlend(bool enabled);
+ 
+   void SetInFenceFd(int fd) { if (m_inFenceFd != -1) close(m_inFenceFd); m_inFenceFd = fd; }
+   int TakeOutFenceFd()
+@@ -163,6 +164,7 @@
+ 
+   int m_inFenceFd{-1};
+   int m_outFenceFd{-1};
++  int m_tvledSavedBlend{-1};
+ };
+ 
+ class CAMLDisplay
+@@ -196,7 +198,9 @@
+     { m_amlDRMUtils->aml_set_drmProperty(name, obj_type, value); }
+   void aml_set_drmProperty(std::string name, unsigned int obj_type, std::string value)
+     { m_amlDRMUtils->aml_set_drmProperty(name, obj_type, value); }
+-  void FlipPage(uint32_t fb_id) { m_amlDRMUtils->FlipPage(fb_id); }
++  void FlipPage(uint32_t fb_id, unsigned int bufferWidth = 0, unsigned int bufferHeight = 0)
++    { m_amlDRMUtils->FlipPage(fb_id, bufferWidth, bufferHeight); }
++  bool SetTvledGuiBlend(bool enabled) { return m_amlDRMUtils->SetTvledGuiBlend(enabled); }
+   bool aml_set_drmDevice_active(bool active) const
+     { return m_amlDRMUtils->aml_set_drmDevice_active(
+       m_amlDRMUtils->aml_get_drmDevice_mode(),
+diff --git a/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.cpp b/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.cpp
+--- a/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.cpp
++++ b/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.cpp
+@@ -10,12 +10,15 @@
+ #include "WinSystemAmlogicGLESContext.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/AMLCodec.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/AMLDvFelOutput.h"
++#include "cores/VideoPlayer/DVDCodecs/Video/tvled_gui_shader.h"
+ #include "messaging/ApplicationMessenger.h"
+ #include "platform/linux/SysfsPath.h"
++#include "rendering/GLExtensions.h"
+ #include "ServiceBroker.h"
+ #include "settings/Settings.h"
+ #include "settings/SettingsComponent.h"
+ #include "utils/AMLUtils.h"
++#include "utils/GLUtils.h"
+ #include "utils/MathUtils.h"
+ #include "utils/XTimeUtils.h"
+ #include "utils/log.h"
+@@ -23,6 +26,10 @@
+ #include "windowing/GraphicContext.h"
+ #include "windowing/WindowSystemFactory.h"
+ 
++#include <drm_fourcc.h>
++#include <fstream>
++#include <unistd.h>
++
+ extern "C"
+ {
+ #include <libavutil/pixfmt.h>
+@@ -32,6 +39,78 @@
+ using namespace KODI::WINDOWING::AML;
+ using namespace std::chrono_literals;
+ 
++namespace
++{
++struct GuiCarrierState
++{
++  struct Attribute
++  {
++    GLuint index;
++    GLint enabled, size, type, normalized, stride, buffer;
++    void* pointer;
++  } attributes[2];
++  GLint framebuffer, program, activeTexture, texture, arrayBuffer;
++  GLint viewport[4];
++  GLboolean mask[4];
++  const GLenum caps[6] = {GL_SCISSOR_TEST, GL_DEPTH_TEST, GL_BLEND, GL_DITHER,
++                          GL_CULL_FACE, GL_STENCIL_TEST};
++  GLboolean enabled[6];
++
++  GuiCarrierState(GLuint position, GLuint texcoord)
++  {
++    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
++    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
++    glGetIntegerv(GL_ACTIVE_TEXTURE, &activeTexture);
++    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &arrayBuffer);
++    glGetIntegerv(GL_VIEWPORT, viewport);
++    glGetBooleanv(GL_COLOR_WRITEMASK, mask);
++    glActiveTexture(GL_TEXTURE0);
++    glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
++    for (unsigned int i = 0; i < 6; ++i)
++      enabled[i] = glIsEnabled(caps[i]);
++    attributes[0].index = position;
++    attributes[1].index = texcoord;
++    for (auto& a : attributes)
++    {
++      glGetVertexAttribiv(a.index, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &a.enabled);
++      glGetVertexAttribiv(a.index, GL_VERTEX_ATTRIB_ARRAY_SIZE, &a.size);
++      glGetVertexAttribiv(a.index, GL_VERTEX_ATTRIB_ARRAY_TYPE, &a.type);
++      glGetVertexAttribiv(a.index, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &a.normalized);
++      glGetVertexAttribiv(a.index, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &a.stride);
++      glGetVertexAttribiv(a.index, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &a.buffer);
++      glGetVertexAttribPointerv(a.index, GL_VERTEX_ATTRIB_ARRAY_POINTER, &a.pointer);
++    }
++  }
++
++  ~GuiCarrierState()
++  {
++    for (const auto& a : attributes)
++    {
++      glBindBuffer(GL_ARRAY_BUFFER, a.buffer);
++      glVertexAttribPointer(a.index, a.size, a.type, a.normalized, a.stride, a.pointer);
++      if (a.enabled)
++        glEnableVertexAttribArray(a.index);
++      else
++        glDisableVertexAttribArray(a.index);
++    }
++    glBindBuffer(GL_ARRAY_BUFFER, arrayBuffer);
++    glBindTexture(GL_TEXTURE_2D, texture);
++    glActiveTexture(activeTexture);
++    glUseProgram(program);
++    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
++    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
++    glColorMask(mask[0], mask[1], mask[2], mask[3]);
++    for (unsigned int i = 0; i < 6; ++i)
++    {
++      if (enabled[i])
++        glEnable(caps[i]);
++      else
++        glDisable(caps[i]);
++    }
++  }
++};
++} // namespace
++
+ CWinSystemAmlogicGLESContext::CWinSystemAmlogicGLESContext()
+ : m_pGLContext(new CEGLContextUtils(EGL_PLATFORM_GBM_MESA, "EGL_EXT_platform_base"))
+ {
+@@ -98,6 +177,8 @@
+ bool CWinSystemAmlogicGLESContext::DestroyWindowSystem()
+ {
+   ResetHdrGuiSession();
++  if (!DestroyTvledGui())
++    CLog::Log(LOGERROR, "TV-led GUI blend state could not be restored during shutdown");
+ 
+   if (IsPresentationReady())
+   {
+@@ -198,12 +279,13 @@
+     SetPresentationReady(false);
+     if (!CAMLDvFelOutput::Prepare(res.iScreenWidth, res.iScreenHeight))
+       return failOutput();
+-    if (tvledOutput)
++    if (tvledOutput || m_tvledSurfaceWidth != 0)
+       ResetHdrGuiSession();
+   }
+ 
+   // destroy old window, then create a new one
+-  DestroyWindow();
++  if (!DestroyWindow())
++    return failOutput();
+ 
+   // check if a forced mode switch is required
+   if (force_mode_switch_by_hotplug)
+@@ -243,7 +325,15 @@
+   }
+ 
+   uint32_t format = m_pGLContext->GetConfigAttrib(EGL_NATIVE_VISUAL_ID);
+-  if (!m_amlGBMUtils->CreateSurface(res.iWidth, res.iHeight, format))
++  if (tvledOutput && format != DRM_FORMAT_ARGB8888 && format != DRM_FORMAT_ABGR8888 &&
++      format != DRM_FORMAT_RGBA8888 && format != DRM_FORMAT_BGRA8888)
++  {
++    CLog::Log(LOGERROR, "TV-led GUI requires an RGBA8 scanout format, got {}", format);
++    return failOutput();
++  }
++  const int surfaceWidth = tvledOutput ? res.iScreenWidth : res.iWidth;
++  const int surfaceHeight = tvledOutput ? res.iScreenHeight : res.iHeight;
++  if (!m_amlGBMUtils->CreateSurface(surfaceWidth, surfaceHeight, format))
+   {
+     CLog::Log(LOGDEBUG, "CWinSystemAmlogicGLESContext::{} - failed to create GBM surface", __FUNCTION__);
+     DestroyWindow();
+@@ -263,6 +353,14 @@
+   {
+     DestroyWindow();
+     return failOutput();
++  }
++
++  if (tvledOutput)
++  {
++    m_tvledSurfaceWidth = surfaceWidth;
++    m_tvledSurfaceHeight = surfaceHeight;
++    if (m_pGLContext->GetConfigAttrib(EGL_ALPHA_SIZE) < 8 || !CreateTvledGui())
++      return failOutput();
+   }
+ 
+   if (managedOutput)
+@@ -292,10 +390,302 @@
+ 
+ bool CWinSystemAmlogicGLESContext::DestroyWindow()
+ {
++  if (!DestroyTvledGui())
++    return false;
+   m_pGLContext->DestroySurface();
+   return CWinSystemAmlogic::DestroyWindow();
+ }
+ 
++bool CWinSystemAmlogicGLESContext::CreateTvledGui()
++{
++  for (unsigned int i = 0; i < 8; ++i)
++  {
++    const GLenum inherited = glGetError();
++    if (inherited == GL_NO_ERROR)
++      break;
++    CLog::Log(LOGWARNING, "TV-led GUI inherited GL error {} before resource creation", inherited);
++    if (inherited == 0x0507 || i == 7)
++      return false;
++  }
++#if defined(GL_KHR_debug)
++  if (!m_tvledDebugCallback && CGLExtensions::IsExtensionSupported(CGLExtensions::KHR_debug))
++  {
++    auto callback = CEGLUtils::GetRequiredProcAddress<PFNGLDEBUGMESSAGECALLBACKKHRPROC>(
++        "glDebugMessageCallbackKHR");
++    auto getPointer = CEGLUtils::GetRequiredProcAddress<PFNGLGETPOINTERVKHRPROC>(
++        "glGetPointervKHR");
++    void* previous = nullptr;
++    getPointer(GL_DEBUG_CALLBACK_FUNCTION_KHR, &previous);
++    m_tvledSavedDebugCallback = reinterpret_cast<GLDEBUGPROCKHR>(previous);
++    getPointer(GL_DEBUG_CALLBACK_USER_PARAM_KHR, &m_tvledSavedDebugUser);
++    m_tvledSavedDebugOutput = glIsEnabled(GL_DEBUG_OUTPUT_KHR);
++    m_tvledSavedDebugSync = glIsEnabled(GL_DEBUG_OUTPUT_SYNCHRONOUS_KHR);
++    m_tvledDebugCallback = callback;
++    glEnable(GL_DEBUG_OUTPUT_KHR);
++    glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS_KHR);
++    callback(KODI::UTILS::GL::GlErrorCallback, nullptr);
++    CLog::Log(LOGDEBUG, "TV-led GUI synchronous GL_KHR_debug callback enabled");
++  }
++#endif
++  GLint maximum = 0;
++  glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maximum);
++  const auto checked = [&](const char* stage) {
++    const GLenum error = glGetError();
++    if (error != GL_NO_ERROR)
++      CLog::Log(LOGERROR, "TV-led GUI {}: GL error {}, logical {}x{}, max texture {}",
++                stage, error, m_nWidth, m_nHeight, maximum);
++    return error == GL_NO_ERROR;
++  };
++  if (!checked("texture limit query") || m_nWidth <= 0 || m_nHeight <= 0 ||
++      m_nWidth > maximum || m_nHeight > maximum)
++  {
++    CLog::Log(LOGERROR, "TV-led GUI invalid texture geometry {}x{}, maximum {}",
++              m_nWidth, m_nHeight, maximum);
++    return false;
++  }
++  m_tvledGuiShader = std::make_unique<Shaders::CGLSLShaderProgram>();
++  m_tvledGuiShader->VertexShader()->SetSource(TVLED_GUI_VERTEX_SHADER);
++  m_tvledGuiShader->PixelShader()->SetSource(TVLED_GUI_CARRIER_SHADER);
++  if (!m_tvledGuiShader->CompileAndLink() || !checked("shader compile/link"))
++    return false;
++
++  GLint active = GL_TEXTURE0, texture = 0, buffer = 0;
++  glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
++  glActiveTexture(GL_TEXTURE0);
++  glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
++  glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &buffer);
++#if defined(GL_PIXEL_UNPACK_BUFFER)
++  EGLint contextVersion = 0;
++  eglQueryContext(GetEGLDisplay(), GetEGLContext(), EGL_CONTEXT_CLIENT_VERSION, &contextVersion);
++  GLint unpackBuffer = 0, unpackRows = 0, unpackSkipRows = 0, unpackSkipPixels = 0;
++  if (contextVersion >= 3)
++  {
++    glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpackBuffer);
++    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &unpackRows);
++    glGetIntegerv(GL_UNPACK_SKIP_ROWS, &unpackSkipRows);
++    glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &unpackSkipPixels);
++  }
++  CLog::Log(LOGDEBUG, "TV-led GUI resources: logical {}x{}, max texture {}, ES{}, unpack {} row {}",
++            m_nWidth, m_nHeight, maximum, contextVersion, unpackBuffer, unpackRows);
++#endif
++  const bool saved = checked("save upload state");
++  const auto restore = [&]() {
++#if defined(GL_PIXEL_UNPACK_BUFFER)
++    if (contextVersion >= 3)
++    {
++      glBindBuffer(GL_PIXEL_UNPACK_BUFFER, unpackBuffer);
++      glPixelStorei(GL_UNPACK_ROW_LENGTH, unpackRows);
++      glPixelStorei(GL_UNPACK_SKIP_ROWS, unpackSkipRows);
++      glPixelStorei(GL_UNPACK_SKIP_PIXELS, unpackSkipPixels);
++    }
++#endif
++    glBindBuffer(GL_ARRAY_BUFFER, buffer);
++    glBindTexture(GL_TEXTURE_2D, texture);
++    glActiveTexture(active);
++    return checked("restore upload state");
++  };
++  if (!saved)
++  {
++    restore();
++    return false;
++  }
++#if defined(GL_PIXEL_UNPACK_BUFFER)
++  if (contextVersion >= 3)
++  {
++    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++    glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
++    glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
++  }
++#endif
++  glGenTextures(1, &m_tvledGuiTexture);
++  glBindTexture(GL_TEXTURE_2D, m_tvledGuiTexture);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++  if (!checked("texture setup"))
++  {
++    restore();
++    return false;
++  }
++  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, m_nWidth, m_nHeight, 0,
++               GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++  if (!checked("texture storage"))
++  {
++    restore();
++    return false;
++  }
++  const GLfloat quad[] = {-1, -1, 0, 0, 1, -1, 1, 0,
++                          -1, 1, 0, 1, 1, 1, 1, 1};
++  glGenBuffers(1, &m_tvledGuiBuffer);
++  glBindBuffer(GL_ARRAY_BUFFER, m_tvledGuiBuffer);
++  glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
++  const bool allocated = checked("vertex buffer storage");
++  const bool restored = restore();
++  if (!allocated || !restored)
++    return false;
++  if (!m_amlDisplay->SetTvledGuiBlend(true) || !SetGuiCompositing(AVCOL_TRC_SMPTE2084))
++    return false;
++  m_tvledGuiFailed = false;
++  return true;
++}
++
++bool CWinSystemAmlogicGLESContext::DestroyTvledGui()
++{
++  if (m_tvledGuiTexture)
++    glDeleteTextures(1, &m_tvledGuiTexture);
++  if (m_tvledGuiBuffer)
++    glDeleteBuffers(1, &m_tvledGuiBuffer);
++  m_tvledGuiTexture = m_tvledGuiBuffer = 0;
++  m_tvledGuiShader.reset();
++  m_tvledSurfaceWidth = m_tvledSurfaceHeight = 0;
++  m_tvledGuiFailed = false;
++  m_tvledCarrierLocationsLogged = m_tvledCompositeLocationsLogged = false;
++#if defined(GL_KHR_debug)
++  if (m_tvledDebugCallback)
++  {
++    m_tvledDebugCallback(m_tvledSavedDebugCallback, m_tvledSavedDebugUser);
++    if (!m_tvledSavedDebugOutput)
++      glDisable(GL_DEBUG_OUTPUT_KHR);
++    if (!m_tvledSavedDebugSync)
++      glDisable(GL_DEBUG_OUTPUT_SYNCHRONOUS_KHR);
++    m_tvledDebugCallback = nullptr;
++  }
++#endif
++  return m_amlDisplay->SetTvledGuiBlend(false);
++}
++
++void CWinSystemAmlogicGLESContext::ClearTvledGui()
++{
++  GLint framebuffer;
++  GLboolean mask[4];
++  GLfloat color[4];
++  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
++  glGetBooleanv(GL_COLOR_WRITEMASK, mask);
++  glGetFloatv(GL_COLOR_CLEAR_VALUE, color);
++  const bool scissor = glIsEnabled(GL_SCISSOR_TEST);
++  glBindFramebuffer(GL_FRAMEBUFFER, 0);
++  glDisable(GL_SCISSOR_TEST);
++  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++  glClearColor(0, 0, 0, 0);
++  glClear(GL_COLOR_BUFFER_BIT);
++  glClearColor(color[0], color[1], color[2], color[3]);
++  glColorMask(mask[0], mask[1], mask[2], mask[3]);
++  if (scissor)
++    glEnable(GL_SCISSOR_TEST);
++  glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
++}
++
++bool CWinSystemAmlogicGLESContext::RenderTvledGui()
++{
++  bool inheritedFailure = false;
++  for (unsigned int i = 0; i < 8; ++i)
++  {
++    const GLenum error = glGetError();
++    if (error == GL_NO_ERROR)
++      break;
++    CLog::Log(LOGERROR, "TV-led GUI inherited drawing error {} before carrier pass", error);
++    inheritedFailure = true;
++    if (error == 0x0507 || i == 7)
++      return false;
++  }
++  if (inheritedFailure)
++    return false;
++  const auto checked = [&](const char* stage) {
++    const GLenum error = glGetError();
++    if (error != GL_NO_ERROR)
++      CLog::Log(LOGERROR, "TV-led GUI {}: GL error {}, logical {}x{}, physical {}x{}",
++                stage, error, m_nWidth, m_nHeight, m_tvledSurfaceWidth, m_tvledSurfaceHeight);
++    return error == GL_NO_ERROR;
++  };
++  if (!m_tvledGuiShader || !m_tvledGuiTexture || !m_tvledGuiBuffer ||
++      !m_guiCompositing || m_guiCompositeTransfer != AVCOL_TRC_SMPTE2084 ||
++      m_tvledSurfaceWidth <= 0 || m_tvledSurfaceHeight <= 0)
++    return false;
++  const GLuint program = m_tvledGuiShader->ProgramHandle();
++  const GLint position = glGetAttribLocation(program, "a_pos");
++  const GLint texcoord = glGetAttribLocation(program, "a_tex");
++  if (!m_tvledCarrierLocationsLogged)
++  {
++    CLog::Log(LOGINFO, "TV-led carrier program {}: position {}, texcoord {}", program,
++              position, texcoord);
++    m_tvledCarrierLocationsLogged = true;
++  }
++  if (position < 0 || texcoord < 0)
++    CLog::Log(LOGERROR, "TV-led carrier attributes missing in program {}: {}/{}", program,
++              position, texcoord);
++  if (!checked("carrier attribute locations") || position < 0 || texcoord < 0)
++    return false;
++  const bool rendered = [&]() {
++    GuiCarrierState state(position, texcoord);
++    if (!checked("save carrier state"))
++      return false;
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    glBindTexture(GL_TEXTURE_2D, m_tvledGuiTexture);
++    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, m_nWidth, m_nHeight);
++    if (!checked("copy GUI framebuffer"))
++      return false;
++    glViewport(0, 0, m_tvledSurfaceWidth, m_tvledSurfaceHeight);
++    for (const GLenum cap : state.caps)
++      glDisable(cap);
++    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    if (!m_tvledGuiShader->Enable())
++      return false;
++    glUniform1i(glGetUniformLocation(program, "u_gui"), 0);
++    glUniform2f(glGetUniformLocation(program, "u_guiSize"), m_nWidth, m_nHeight);
++    glUniform2f(glGetUniformLocation(program, "u_outputSize"), m_tvledSurfaceWidth,
++                 m_tvledSurfaceHeight);
++    glUniform1f(glGetUniformLocation(program, "u_limited"), UseLimitedColor() ? 1.0f : 0.0f);
++    int map = 0;
++    std::ifstream mapFile("/storage/dvfel_gui_map");
++    int requestedMap;
++    if (mapFile >> requestedMap && requestedMap >= 0 && requestedMap <= 5)
++      map = requestedMap;
++    glUniform1i(glGetUniformLocation(program, "u_map"), map);
++    glUniform1f(glGetUniformLocation(program, "u_probe"),
++                 access("/storage/dvfel_gui_probe", F_OK) == 0 ? 1.0f : 0.0f);
++    glBindBuffer(GL_ARRAY_BUFFER, m_tvledGuiBuffer);
++    glVertexAttribPointer(position, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
++    glVertexAttribPointer(texcoord, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
++                          reinterpret_cast<void*>(2 * sizeof(GLfloat)));
++    glEnableVertexAttribArray(position);
++    glEnableVertexAttribArray(texcoord);
++    if (!checked("carrier uniforms and attributes"))
++    {
++      m_tvledGuiShader->Disable();
++      return false;
++    }
++    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++    const bool drawn = checked("carrier draw");
++    m_tvledGuiShader->Disable();
++    const bool disabled = checked("disable carrier program");
++    return drawn && disabled;
++  }();
++  const bool restored = checked("restore carrier state");
++  return rendered && restored;
++}
++
++void CWinSystemAmlogicGLESContext::TraceTvledGuiStage(const char* stage)
++{
++  if (!CAMLDvFelOutput::Active() || !CAMLDvFelOutput::Ready() || m_tvledSurfaceWidth <= 0)
++    return;
++  bool failed = false;
++  for (unsigned int i = 0; i < 8; ++i)
++  {
++    const GLenum error = glGetError();
++    if (error == GL_NO_ERROR)
++      break;
++    CLog::Log(LOGERROR, "TV-led GUI stage {}: GL error {}", stage, error);
++    failed = true;
++  }
++  if (failed && !m_tvledGuiFailed)
++  {
++    m_tvledGuiFailed = true;
++    CServiceBroker::GetAppMessenger()->PostMsg(TMSG_MEDIA_STOP);
++  }
++}
++
+ bool CWinSystemAmlogicGLESContext::ResizeWindow(int newWidth, int newHeight, int newLeft, int newTop)
+ {
+   CRenderSystemGLES::ResetRenderSystem(newWidth, newHeight);
+@@ -330,6 +720,19 @@
+   SetVSync(true);
+   if (rendered)
+   {
++    if (CAMLDvFelOutput::Active() && CAMLDvFelOutput::Ready())
++    {
++      if (m_tvledGuiFailed || !RenderTvledGui())
++      {
++        ClearTvledGui();
++        if (!m_tvledGuiFailed)
++        {
++          m_tvledGuiFailed = true;
++          CLog::Log(LOGERROR, "TV-led GUI carrier conversion failed; stopping playback");
++          CServiceBroker::GetAppMessenger()->PostMsg(TMSG_MEDIA_STOP);
++        }
++      }
++    }
+ #if defined(EGL_ANDROID_native_fence_sync) && defined(EGL_KHR_fence_sync)
+     if (m_eglFence)
+     {
+@@ -362,7 +765,8 @@
+     {
+       // this flip latches no earlier than the vsync after the last step: pace on the next one
+       m_presentStepSeen = CAMLCodec::PresentSteps();
+-      m_amlDisplay->FlipPage(m_amlGBMUtils->GetFBId());
++      m_amlDisplay->FlipPage(m_amlGBMUtils->GetFBId(), m_tvledSurfaceWidth,
++                            m_tvledSurfaceHeight);
+     }
+   }
+   else if (!videoLayer)
+@@ -391,8 +795,6 @@
+ 
+ bool CWinSystemAmlogicGLESContext::SetGuiCompositing(int colorTransfer)
+ {
+-  if (CAMLDvFelOutput::Active())
+-    colorTransfer = 0;
+   m_guiCompositing = (colorTransfer != 0);
+ 
+   if (m_guiCompositing)
+@@ -470,9 +872,8 @@
+ {
+   if (CAMLDvFelOutput::Active())
+   {
+-    ResetHdrGuiSession();
+-    GetGfxContext().SetTransferPQ(false);
+-    return 0;
++    colorTransfer = AVCOL_TRC_SMPTE2084;
++    dvGraphics = false;
+   }
+   std::lock_guard lock(m_hdrGuiMutex);
+ 
+@@ -539,6 +940,7 @@
+ 
+ bool CWinSystemAmlogicGLESContext::BeginGuiComposite(bool guiWillRender)
+ {
++  TraceTvledGuiStage("BeginGuiComposite entry");
+   if (!m_guiCompositing)
+     return false;
+ 
+@@ -551,14 +953,19 @@
+   if (!m_guiFbo.IsValid() || m_guiFboWidth != width || m_guiFboHeight != height)
+   {
+     m_guiFbo.Cleanup();
+-
+-    if (!m_guiFbo.Initialize())
++    TraceTvledGuiStage("GUI FBO cleanup");
++
++    const bool initialized = m_guiFbo.Initialize();
++    TraceTvledGuiStage("GUI FBO initialize");
++    if (!initialized)
+     {
+       CLog::Log(LOGERROR, "CWinSystemAmlogicGLESContext: failed to initialize GUI FBO");
+       return false;
+     }
+ 
+-    if (!m_guiFbo.CreateAndBindToTexture(GL_TEXTURE_2D, width, height, GL_RGBA))
++    const bool created = m_guiFbo.CreateAndBindToTexture(GL_TEXTURE_2D, width, height, GL_RGBA);
++    TraceTvledGuiStage("GUI FBO texture creation");
++    if (!created)
+     {
+       CLog::Log(LOGERROR, "CWinSystemAmlogicGLESContext: failed to create GUI FBO texture {}x{}", width,
+                 height);
+@@ -566,7 +973,10 @@
+       return false;
+     }
+ 
+-    if (GetEnabledFrontToBackRendering() && !m_guiFbo.AttachDepthBuffer(width, height))
++    const bool depthAttached = !GetEnabledFrontToBackRendering() ||
++                               m_guiFbo.AttachDepthBuffer(width, height);
++    TraceTvledGuiStage("GUI FBO depth attachment");
++    if (!depthAttached)
+     {
+       CLog::Log(LOGERROR,
+                 "CWinSystemAmlogicGLESContext: failed to attach depth buffer to GUI FBO {}x{}", width,
+@@ -616,7 +1026,9 @@
+     }
+   }
+ 
+-  if (!m_guiFbo.BeginRender())
++  const bool began = m_guiFbo.BeginRender();
++  TraceTvledGuiStage("GUI FBO BeginRender");
++  if (!began)
+     return false;
+ 
+   // Clear only when the FBO holds stale content; idle frames are already clean.
+@@ -624,6 +1036,7 @@
+   {
+     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+     glClear(GL_COLOR_BUFFER_BIT);
++    TraceTvledGuiStage("GUI FBO clear");
+     m_guiFboClean = true;
+   }
+ 
+@@ -636,7 +1049,9 @@
+   if (!m_guiWillRender)
+     return;
+ 
++  TraceTvledGuiStage("EndGuiComposite entry after GUI rendering");
+   m_guiFbo.EndRender();
++  TraceTvledGuiStage("GUI FBO EndRender");
+ 
+   // Clear the backbuffer before video renders. In the FBO compositing path,
+   // video renders in the RenderEx pass with clear=false, so DrawBlackBars is
+@@ -645,6 +1060,7 @@
+   // GUI and video playback.
+   glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+   glClear(GL_COLOR_BUFFER_BIT);
++  TraceTvledGuiStage("GUI backbuffer clear");
+ }
+ 
+ // CompositeGui is the last GL operation in the frame (called just before EndRender).
+@@ -667,6 +1083,96 @@
+   }
+   else
+   {
++    return;
++  }
++
++  if (CAMLDvFelOutput::Active())
++  {
++    const GLint posLoc = m_compositeShader->GetPosLoc();
++    const GLint texLoc = m_compositeShader->GetTexLoc();
++    if (!m_tvledCompositeLocationsLogged)
++    {
++      CLog::Log(LOGINFO, "TV-led PQ GUI program {}: position {}, texcoord {}",
++                m_compositeShader->ProgramHandle(), posLoc, texLoc);
++      m_tvledCompositeLocationsLogged = true;
++    }
++    const auto fail = [&](const char* stage) {
++      CLog::Log(LOGERROR, "TV-led PQ GUI composite failed at {}", stage);
++      if (!m_tvledGuiFailed)
++      {
++        m_tvledGuiFailed = true;
++        CServiceBroker::GetAppMessenger()->PostMsg(TMSG_MEDIA_STOP);
++      }
++    };
++    bool inheritedFailure = false;
++    for (unsigned int i = 0; i < 8; ++i)
++    {
++      const GLenum error = glGetError();
++      if (error == GL_NO_ERROR)
++        break;
++      CLog::Log(LOGERROR, "TV-led PQ GUI inherited drawing error {} before composite", error);
++      inheritedFailure = true;
++    }
++    if (inheritedFailure)
++    {
++      fail("prior GUI rendering");
++      return;
++    }
++    if (posLoc < 0 || texLoc < 0 || !m_tvledGuiBuffer)
++    {
++      fail("shader attributes or vertex buffer unavailable");
++      return;
++    }
++    const auto checked = [&](const char* stage) {
++      const GLenum error = glGetError();
++      if (error != GL_NO_ERROR)
++      {
++        CLog::Log(LOGERROR, "TV-led PQ GUI {}: GL error {}", stage, error);
++        fail(stage);
++      }
++      return error == GL_NO_ERROR;
++    };
++    const bool drawn = [&]() {
++      GuiCarrierState state(posLoc, texLoc);
++      if (!checked("save composite state"))
++        return false;
++      for (const GLenum cap : state.caps)
++        glDisable(cap);
++      glViewport(0, 0, m_guiFboWidth, m_guiFboHeight);
++      glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++      glActiveTexture(GL_TEXTURE0);
++      glBindTexture(GL_TEXTURE_2D, m_guiFbo.Texture());
++      glEnable(GL_BLEND);
++      glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
++                          GL_ONE_MINUS_SRC_ALPHA);
++      static const GLfloat identity[16] = {1, 0, 0, 0, 0, 1, 0, 0,
++                                          0, 0, 1, 0, 0, 0, 0, 1};
++      m_compositeShader->SetProjection(identity);
++      if (!m_compositeShader->Enable())
++      {
++        fail("enable PQ program");
++        return false;
++      }
++      glBindBuffer(GL_ARRAY_BUFFER, m_tvledGuiBuffer);
++      glVertexAttribPointer(posLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
++      glVertexAttribPointer(texLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
++                            reinterpret_cast<void*>(2 * sizeof(GLfloat)));
++      glEnableVertexAttribArray(posLoc);
++      glEnableVertexAttribArray(texLoc);
++      if (!checked("PQ uniforms and attributes"))
++      {
++        m_compositeShader->Disable();
++        return false;
++      }
++      glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++      const bool result = checked("PQ draw");
++      m_compositeShader->Disable();
++      const bool disabled = checked("disable PQ program");
++      return result && disabled;
++    }();
++    const bool restored = checked("restore composite state");
++    if (!drawn || !restored)
++      return;
+     return;
+   }
+ 
+diff --git a/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.h b/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.h
+--- a/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.h
++++ b/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.h
+@@ -74,6 +74,26 @@
+   std::unique_ptr<CEGLContextUtils> m_pGLContext;
+   StreamHdrType m_hdrType = StreamHdrType::HDR_TYPE_NONE;
+   bool m_tvledOutput{false};
++  int m_tvledSurfaceWidth{0};
++  int m_tvledSurfaceHeight{0};
++  std::unique_ptr<Shaders::CGLSLShaderProgram> m_tvledGuiShader;
++  GLuint m_tvledGuiTexture{0};
++  GLuint m_tvledGuiBuffer{0};
++  bool m_tvledGuiFailed{false};
++  bool m_tvledCarrierLocationsLogged{false};
++  bool m_tvledCompositeLocationsLogged{false};
++#if defined(GL_KHR_debug)
++  PFNGLDEBUGMESSAGECALLBACKKHRPROC m_tvledDebugCallback{nullptr};
++  GLDEBUGPROCKHR m_tvledSavedDebugCallback{nullptr};
++  void* m_tvledSavedDebugUser{nullptr};
++  GLboolean m_tvledSavedDebugOutput{GL_FALSE};
++  GLboolean m_tvledSavedDebugSync{GL_FALSE};
++#endif
++  bool CreateTvledGui();
++  bool RenderTvledGui();
++  bool DestroyTvledGui();
++  void ClearTvledGui();
++  void TraceTvledGuiStage(const char* stage);
+   uint64_t m_presentStepSeen{0};
+ 
+   bool m_guiCompositing{false};

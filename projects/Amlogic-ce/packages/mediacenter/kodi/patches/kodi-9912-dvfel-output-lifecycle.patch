@@ -1,0 +1,480 @@
+Subject: [PATCH] dvfel: prepare TV-led output in Kodi's normal display lifecycle
+
+Keep the existing first-picture configuration and refresh-rate selection.
+Only a confirmed FEL session with the automatic-output marker bypasses
+native DV processing, and it retains dual-layer hardware decoding. Guard
+carrier visibility/PQ until the normal window transaction acknowledges the
+output owner. Restore the original GUI through the same display lifecycle.
+Ordinary playback keeps its original path. Requires the 9911 carrier patch.
+---
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp
+@@ -8,6 +8,7 @@
+ 
+ 
+ #include "AMLCodec.h"
++#include "AMLDvFelOutput.h"
+ #include "AMLMvc.h"
+ #include "DynamicDll.h"
+ 
+@@ -425,6 +426,7 @@
+   int               dumpfile;
+   bool              dumpdemux;
+   bool              dovi_zero_level5{false};
++  bool              tvled_output{false};
+ } am_private_t;
+ 
+ typedef struct vframe_states
+@@ -2182,6 +2184,7 @@
+   m_brightness = -1;
+   m_vadj1_enabled = false;
+   m_hints = hints;
++  am_private->tvled_output = CAMLDvFelOutput::Active();
+   m_state = 0;
+   m_hints.pClock = hints.pClock;
+   m_tp_last_frame = std::chrono::system_clock::now();
+@@ -2362,10 +2365,21 @@
+ 
+   // default enable HDR10+
+   auto hdr_cap = CServiceBroker::GetWinSystem()->GetDisplayHDRCapabilities();
+-  if (hdr_cap.SupportsHDR10Plus())
++  if (!am_private->tvled_output && hdr_cap.SupportsHDR10Plus())
+     AmlDisplay->aml_set_drmProperty("enable_hdr10plus", DRM_MODE_OBJECT_CRTC, 1);
+ 
+-  if (dv_enable)
++  if (am_private->tvled_output)
++  {
++    // Decoder dual-layer mode is independent of the native Dolby processor.
++    am_private->gcodec.dv_enable = 1;
++    if ((hints.dovi.dv_profile == 4 || hints.dovi.dv_profile == 7) && doviIsFEL)
++    {
++      AmlDisplay->aml_set_drmProperty("dv_debug", DRM_MODE_OBJECT_CRTC, "enable_fel 1");
++      AmlDisplay->aml_set_drmProperty("dv_debug", DRM_MODE_OBJECT_CRTC, "enable_mel 1");
++      am_private->gcodec.dec_mode = STREAM_TYPE_STREAM;
++    }
++  }
++  else if (dv_enable)
+   {
+     // enable Dolby Vision
+     AmlDisplay->aml_set_drmProperty("dv_enable", DRM_MODE_OBJECT_CRTC, 1);
+@@ -2708,7 +2722,7 @@
+   }
+ 
+   // disable Dolby Vision VS-Engine for non DV media
+-  if (dv_enabled && dolby_vision_policy == AMDV_FORCE_OUTPUT_MODE)
++  if (!am_private->tvled_output && dv_enabled && dolby_vision_policy == AMDV_FORCE_OUTPUT_MODE)
+     AmlDisplay->aml_set_drmProperty("dv_mode", DRM_MODE_OBJECT_CRTC, AMDV_OUTPUT_MODE_BYPASS);
+ 
+   m_dll->codec_close(&am_private->vcodec);
+@@ -2729,7 +2743,7 @@
+   // return tsync to default so external apps work
+   CSysfsPath("/sys/class/tsync/enable", 1);
+   // disable Dolby Vision driver
+-  if (dv_enabled)
++  if (!am_private->tvled_output && dv_enabled)
+   {
+     // the transition needs a few display frames before the core powers down
+     std::chrono::time_point<std::chrono::system_clock> now(std::chrono::system_clock::now());
+@@ -2748,8 +2762,9 @@
+ 
+     AmlDisplay->aml_set_drmProperty("dv_enable", DRM_MODE_OBJECT_CRTC, 0);
+   }
+-  else if (CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(CSettings::SETTING_COREELEC_AMLOGIC_SDR2HDR) ||
+-           CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(CSettings::SETTING_COREELEC_AMLOGIC_HDR2SDR))
++  else if (!am_private->tvled_output &&
++           (CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(CSettings::SETTING_COREELEC_AMLOGIC_SDR2HDR) ||
++            CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(CSettings::SETTING_COREELEC_AMLOGIC_HDR2SDR)))
+   {
+     AmlDisplay->aml_set_drmProperty("dv_policy", DRM_MODE_OBJECT_CRTC, AMDV_FOLLOW_SOURCE);
+     AmlDisplay->aml_set_drmProperty("hdr_policy", DRM_MODE_OBJECT_CRTC, HDR_FOLLOW_SOURCE);
+@@ -3433,7 +3448,9 @@
+ {
+   static int saved_disable_video = -1;
+ 
+-  int disable_video = show ? 0:1;
++  const bool visible = show && (!am_private || !am_private->tvled_output ||
++                                CAMLDvFelOutput::Ready());
++  int disable_video = visible ? 0:1;
+   if (saved_disable_video == disable_video)
+     return;
+ 
+@@ -3475,6 +3492,28 @@
+   // this routine gets called every video frame
+   // and is in the context of the renderer thread so
+   // do not do anything stupid here.
++  if (am_private->tvled_output)
++  {
++    const auto& resolution = CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo();
++    if (!CAMLDvFelOutput::Ready() || resolution.iScreenWidth != m_hints.width ||
++        resolution.iScreenHeight != m_hints.height || am_private->video_rotation_degree != 0 ||
++        CServiceBroker::GetWinSystem()->GetGfxContext().GetStereoMode() != RenderStereoMode::OFF)
++    {
++      ShowMainVideo(false);
++      return;
++    }
++    const CRect carrier(0, 0, m_hints.width, m_hints.height);
++    if (m_dst_rect != carrier)
++    {
++      m_dst_rect = carrier;
++      CSysfsPath("/sys/class/video/zoom", 100);
++      CSysfsPath("/sys/class/video/axis",
++                StringUtils::Format("0 0 {} {}", m_hints.width - 1, m_hints.height - 1));
++      CSysfsPath("/sys/class/video/screen_mode", 1);
++    }
++    ShowMainVideo(true);
++    return;
++  }
+   bool update = false;
+ 
+   // video zoom adjustment.
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+@@ -13,6 +13,9 @@
+ #include "RenderFactory.h"
+ #include "RenderFlags.h"
+ #include "ServiceBroker.h"
++#ifdef HAS_LIBAMCODEC
++#include "cores/VideoPlayer/DVDCodecs/Video/AMLDvFelOutput.h"
++#endif
+ #include "application/Application.h"
+ #include "cores/VideoPlayer/Interface/TimingConstants.h"
+ #include "guilib/GUIComponent.h"
+@@ -38,6 +41,27 @@
+ 
+ using namespace std::chrono_literals;
+ 
++namespace
++{
++bool TvledOutputActive()
++{
++#ifdef HAS_LIBAMCODEC
++  return CAMLDvFelOutput::Active();
++#else
++  return false;
++#endif
++}
++
++bool TvledOutputNeedsUpdate()
++{
++#ifdef HAS_LIBAMCODEC
++  return CAMLDvFelOutput::NeedsUpdate();
++#else
++  return false;
++#endif
++}
++}
++
+ class CRenderManager::CPresentThread : public CThread
+ {
+ public:
+@@ -119,7 +143,10 @@
+ bool CRenderManager::Configure(const VideoPicture& picture, float fps, unsigned int orientation, int buffers)
+ {
+ 
+-  if (m_amdv_wait_delay == -1)
++  const bool outputUpdate = TvledOutputActive() && TvledOutputNeedsUpdate();
++  if (TvledOutputActive())
++    m_amdv_wait_delay = 0;
++  else if (m_amdv_wait_delay == -1)
+     m_amdv_wait_delay = aml_amdv_wait(picture.hdrType);
+ 
+   // check if something has changed
+@@ -130,7 +157,7 @@
+       return true;
+ 
+     if (m_pRenderer != nullptr && m_picture.IsSameParams(picture) && m_orientation == orientation &&
+-        m_NumberBuffers == buffers && !m_pRenderer->ConfigChanged(picture))
++        m_NumberBuffers == buffers && !m_pRenderer->ConfigChanged(picture) && !outputUpdate)
+     {
+       if (m_fps != fps)
+       {
+@@ -941,6 +968,25 @@
+ 
+ void CRenderManager::UpdateResolution()
+ {
++  const bool tvledOutput = TvledOutputActive();
++  const bool outputUpdate = TvledOutputNeedsUpdate();
++  auto& graphics = CServiceBroker::GetWinSystem()->GetGfxContext();
++  if (outputUpdate)
++  {
++    if (!tvledOutput && !graphics.IsFullScreenVideo())
++    {
++      graphics.SetVideoResolution(graphics.GetVideoResolution(), true);
++      return;
++    }
++    if (tvledOutput)
++    {
++      std::unique_lock lock(m_statelock);
++      // Stream hints can arrive before the first decoded picture and its HDR type.
++      if (m_renderState != STATE_CONFIGURING)
++        return;
++      m_bTriggerUpdateResolution = true;
++    }
++  }
+   if (m_bTriggerUpdateResolution)
+   {
+     if (CServiceBroker::GetWinSystem()->GetGfxContext().IsFullScreenVideo() && CServiceBroker::GetWinSystem()->GetGfxContext().IsFullScreenRoot())
+@@ -955,7 +1001,7 @@
+         m_amdv_wait_delay--;
+         return;
+       }
+-      else if (aml_video_started() || elapsed > std::chrono::seconds(m_render_timeout))
++      else if (tvledOutput || aml_video_started() || elapsed > std::chrono::seconds(m_render_timeout))
+       {
+         const RenderStereoMode user_stereo_mode =
+           CServiceBroker::GetGUI()->GetStereoscopicsManager().GetStereoModeByUser();
+@@ -966,18 +1012,21 @@
+             user_stereo_mode == RenderStereoMode::UNDEFINED)
+           m_bTriggerUpdateResolution = false;
+ 
+-        if (m_bTriggerUpdateResolution &&
+-          CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(CSettings::SETTING_VIDEOPLAYER_ADJUSTREFRESHRATE) != ADJUST_REFRESHRATE_OFF && m_fps > 0.0f)
++        const bool adjustRefresh =
++            CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(CSettings::SETTING_VIDEOPLAYER_ADJUSTREFRESHRATE) != ADJUST_REFRESHRATE_OFF && m_fps > 0.0f;
++        if (m_bTriggerUpdateResolution && (adjustRefresh || outputUpdate))
+         {
+           {
+             // a vsync step already past its m_switching test finishes its queue first
+             std::unique_lock lock(m_statelock);
+             m_switching = true;
+           }
+-          RESOLUTION res = CResolutionUtils::ChooseBestResolution(
+-              m_fps, m_picture.iWidth, m_picture.iHeight, !m_picture.stereoMode.empty());
++          RESOLUTION res = graphics.GetVideoResolution();
++          if (adjustRefresh)
++            res = CResolutionUtils::ChooseBestResolution(
++                m_fps, m_picture.iWidth, m_picture.iHeight, !m_picture.stereoMode.empty());
+           CServiceBroker::GetWinSystem()->GetGfxContext().SetHDRType(m_picture.hdrType);
+-          CServiceBroker::GetWinSystem()->GetGfxContext().SetVideoResolution(res, false);
++          CServiceBroker::GetWinSystem()->GetGfxContext().SetVideoResolution(res, outputUpdate);
+           UpdateLatencyTweak();
+           if (m_pRenderer)
+             m_pRenderer->Update();
+diff --git a/xbmc/windowing/Resolution.cpp b/xbmc/windowing/Resolution.cpp
+--- a/xbmc/windowing/Resolution.cpp
++++ b/xbmc/windowing/Resolution.cpp
+@@ -19,11 +19,25 @@
+ #include "utils/log.h"
+ #include "windowing/WinSystem.h"
+ 
++#ifdef HAS_LIBAMCODEC
++#include "cores/VideoPlayer/DVDCodecs/Video/AMLDvFelOutput.h"
++#endif
++
++#include <algorithm>
+ #include <cstdlib>
+ #include <limits>
+ 
+ namespace
+ {
++
++bool TvledOutputActive()
++{
++#ifdef HAS_LIBAMCODEC
++  return CAMLDvFelOutput::Active();
++#else
++  return false;
++#endif
++}
+ 
+ const char* SETTING_VIDEOSCREEN_WHITELIST_PULLDOWN{"videoscreen.whitelistpulldown"};
+ const char* SETTING_VIDEOSCREEN_WHITELIST_WHOLENUMBER{"videoscreen.whitelistwholenumber"};
+@@ -72,12 +86,14 @@
+   RESOLUTION res = CServiceBroker::GetWinSystem()->GetGfxContext().GetVideoResolution();
+   float weight = 0.0f;
+ 
+-  if (!FindResolutionFromOverride(fps, width, is3D, res, weight, false)) //find a refreshrate from overrides
+-  {
+-    if (!FindResolutionFromOverride(fps, width, is3D, res, weight, true)) //if that fails find it from a fallback
+-    {
+-      FindResolutionFromWhitelist(fps, width, height, is3D, res); //find a refreshrate from whitelist
+-    }
++  const bool overrideFound = FindResolutionFromOverride(fps, width, is3D, res, weight, false) ||
++                             FindResolutionFromOverride(fps, width, is3D, res, weight, true);
++  if (!overrideFound ||
++      (TvledOutputActive() &&
++       CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo(res).fRefreshRate > 60.0f))
++  {
++    weight = 0.0f;
++    FindResolutionFromWhitelist(fps, width, height, is3D, res);
+   }
+ 
+   CLog::Log(LOGINFO, "Display resolution ADJUST : {} ({}) (weight: {:.3f})",
+@@ -152,6 +168,18 @@
+     }
+   }
+ 
++  if (TvledOutputActive())
++  {
++    // The RGB8 TV-led carrier uses the sink's DV transport through 2160p60.
++    // Keep the user's whitelist intact and exclude higher rates only for this session.
++    indexList.erase(std::remove_if(indexList.begin(), indexList.end(), [](const CVariant& mode) {
++                      const auto res = CDisplaySettings::GetInstance().GetResFromString(mode.asString());
++                      return CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo(res).fRefreshRate >
++                             60.0f;
++                    }),
++                    indexList.end());
++  }
++
+   unsigned int penalty = std::numeric_limits<unsigned int>::max();
+   bool found = false;
+ 
+diff --git a/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.cpp b/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.cpp
+--- a/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.cpp
++++ b/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.cpp
+@@ -9,6 +9,8 @@
+ #include "VideoSyncAML.h"
+ #include "WinSystemAmlogicGLESContext.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/AMLCodec.h"
++#include "cores/VideoPlayer/DVDCodecs/Video/AMLDvFelOutput.h"
++#include "messaging/ApplicationMessenger.h"
+ #include "platform/linux/SysfsPath.h"
+ #include "ServiceBroker.h"
+ #include "settings/Settings.h"
+@@ -112,6 +114,24 @@
+                                                bool fullScreen,
+                                                RESOLUTION_INFO& res)
+ {
++  const bool tvledOutput = CAMLDvFelOutput::Active();
++  const bool outputUpdate = CAMLDvFelOutput::NeedsUpdate();
++  const bool managedOutput = tvledOutput || outputUpdate || m_tvledOutput;
++  const bool force_mode_switch_by_output = m_tvledOutput != tvledOutput || outputUpdate;
++  const auto failOutput = [this, tvledOutput]() {
++    if (tvledOutput)
++    {
++      SetPresentationReady(false);
++      CServiceBroker::GetAppMessenger()->PostMsg(TMSG_MEDIA_STOP);
++    }
++    return false;
++  };
++  if (tvledOutput && res.fRefreshRate > 60.0f)
++  {
++    CLog::Log(LOGERROR, "TV-led FEL carrier does not support {:.3f} Hz; stopping playback",
++              res.fRefreshRate);
++    return failOutput();
++  }
+   RESOLUTION_INFO current_resolution;
+   current_resolution.iWidth = current_resolution.iHeight = 0;
+   const RenderStereoMode stereo_mode = CServiceBroker::GetWinSystem()->GetGfxContext().GetStereoMode();
+@@ -133,7 +153,7 @@
+   {
+     CLog::Log(LOGERROR, "CWinSystemAmlogicGLESContext::{}: failed to receive current resolution", __FUNCTION__);
+     SetPresentationReady(false);
+-    return false;
++    return failOutput();
+   }
+ 
+   const std::string new_hdrStr = CStreamDetails::HdrTypeToString(hdrType);
+@@ -166,10 +186,20 @@
+           (res.dwFlags & D3DPRESENTFLAG_MODEMASK) &&
+       m_bWindowCreated && nativeGUI == m_nativeGUI && !force_mode_switch_by_hdr &&
+       !force_mode_switch_by_hotplug && !force_mode_switch_by_fractional_rate &&
+-      !force_mode_switch_by_stereo_mode)
++      !force_mode_switch_by_stereo_mode && !force_mode_switch_by_output)
+   {
+     CLog::Log(LOGDEBUG, "CWinSystemAmlogicGLESContext::{}: No need to create a new window", __FUNCTION__);
+     return true;
++  }
++
++  if (managedOutput)
++  {
++    m_tvledOutput = tvledOutput;
++    SetPresentationReady(false);
++    if (!CAMLDvFelOutput::Prepare(res.iScreenWidth, res.iScreenHeight))
++      return failOutput();
++    if (tvledOutput)
++      ResetHdrGuiSession();
+   }
+ 
+   // destroy old window, then create a new one
+@@ -194,6 +224,9 @@
+     if (force_mode_switch_by_fractional_rate || force_mode_switch_by_hdr)
+       m_force_mode_switch = true;
+   }
++
++  if (force_mode_switch_by_output)
++    m_force_mode_switch = true;
+ 
+   if (m_force_mode_switch)
+     CLog::Log(LOGDEBUG, "CWinSystemAmlogicGLESContext::{}: force mode switch", __FUNCTION__);
+@@ -206,7 +239,7 @@
+ 
+   if (!CWinSystemAmlogic::CreateNewWindow(name, fullScreen, res))
+   {
+-    return false;
++    return failOutput();
+   }
+ 
+   uint32_t format = m_pGLContext->GetConfigAttrib(EGL_NATIVE_VISUAL_ID);
+@@ -214,7 +247,7 @@
+   {
+     CLog::Log(LOGDEBUG, "CWinSystemAmlogicGLESContext::{} - failed to create GBM surface", __FUNCTION__);
+     DestroyWindow();
+-    return false;
++    return failOutput();
+   }
+ 
+   if (!m_pGLContext->CreatePlatformSurface(
+@@ -223,13 +256,24 @@
+   {
+     CLog::Log(LOGDEBUG, "CWinSystemAmlogicGLESContext::{} - failed to create CreatePlatformSurface", __FUNCTION__);
+     DestroyWindow();
+-    return false;
++    return failOutput();
+   }
+ 
+   if (!m_pGLContext->BindContext())
+   {
+     DestroyWindow();
+-    return false;
++    return failOutput();
++  }
++
++  if (managedOutput)
++  {
++    if (tvledOutput)
++    {
++      if (!CAMLDvFelOutput::Commit())
++        return failOutput();
++    }
++    else
++      CAMLDvFelOutput::Finish();
+   }
+ 
+   if (!m_delayDispReset)
+@@ -347,6 +391,8 @@
+ 
+ bool CWinSystemAmlogicGLESContext::SetGuiCompositing(int colorTransfer)
+ {
++  if (CAMLDvFelOutput::Active())
++    colorTransfer = 0;
+   m_guiCompositing = (colorTransfer != 0);
+ 
+   if (m_guiCompositing)
+@@ -422,6 +468,12 @@
+                                                               int colorTransfer,
+                                                               bool dvGraphics)
+ {
++  if (CAMLDvFelOutput::Active())
++  {
++    ResetHdrGuiSession();
++    GetGfxContext().SetTransferPQ(false);
++    return 0;
++  }
+   std::lock_guard lock(m_hdrGuiMutex);
+ 
+   if (owner == 0 || owner != m_hdrGuiOwner)
+diff --git a/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.h b/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.h
+--- a/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.h
++++ b/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.h
+@@ -73,6 +73,7 @@
+ private:
+   std::unique_ptr<CEGLContextUtils> m_pGLContext;
+   StreamHdrType m_hdrType = StreamHdrType::HDR_TYPE_NONE;
++  bool m_tvledOutput{false};
+   uint64_t m_presentStepSeen{0};
+ 
+   bool m_guiCompositing{false};
